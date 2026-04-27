@@ -1,0 +1,567 @@
+fastapi
+uvicorn
+boto3
+joblib
+scikit-learn
+numpy
+anthropic
+python-multipart
+xgboost
+lightgbm
+
+"""
+Deloitte Decision Intelligence Platform — FastAPI Backend
+Capstone Project 2026 | Team 4: Kyle Chen, Sadgee Pandey, Anastasia Raicevic, Ruo Yu Wang
+
+Deployment:
+    nohup python3 -m uvicorn main:app --host 0.0.0.0 --port 8000 > backend.log 2>&1 &
+
+Architecture:
+    - Ensemble ML model (GBM + XGBoost + LightGBM) loaded from AWS S3
+    - Claude AI (AWS Bedrock) extracts market signals from free-form news text
+    - Claude AI generates executive intelligence reports
+    - All AWS access handled via IAM role — no hardcoded credentials
+"""
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import boto3, joblib, numpy as np, json, io, re
+
+app = FastAPI(title="Deloitte ROI Decision System API")
+
+# Allow all origins so the React frontend on port 3000 can reach the backend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# AWS Bedrock client — uses EC2 IAM role (deloitte-ec2-role), no API keys needed
+bedrock  = boto3.client("bedrock-runtime", region_name="us-east-1")
+MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+
+# ---------------------------------------------------------------------------
+# Decision type metadata
+# Drives the "Decision Logic" panel in the frontend transparency section
+# ---------------------------------------------------------------------------
+DECISION_TYPE_LOGIC = {
+    "Marketing": {
+        "description": "Evaluates the ROI of brand awareness and customer acquisition campaigns",
+        "key_drivers": ["Consumer Sentiment", "Campaign Intensity", "Market Volatility (VIX)", "GDP Growth"],
+        "formula": "ROI = (Revenue Lift from Demand Increase - Campaign Cost) / Campaign Cost",
+        "how_it_works": "Marketing decisions are sensitive to consumer sentiment and market conditions. "
+                        "When sentiment is positive and VIX is low, campaigns generate higher conversion rates and demand lift."
+    },
+    "Pricing": {
+        "description": "Predicts the impact of price changes on volume, revenue, and margin",
+        "key_drivers": ["Competitive Pressure", "Consumer Sentiment", "Operating Margin", "Interest Rate"],
+        "formula": "ROI = (New Revenue - Old Revenue - Implementation Cost) / Implementation Cost",
+        "how_it_works": "Pricing decisions depend on competitive pressure and price elasticity signals. "
+                        "High competitive pressure suggests price reductions may be necessary to maintain market share."
+    },
+    "Expansion": {
+        "description": "Assesses the return on opening new locations or entering new markets",
+        "key_drivers": ["GDP Growth", "Unemployment Rate", "External Risk", "Baseline Revenue"],
+        "formula": "ROI = (Projected New Market Revenue - Fixed Costs - Investment) / Investment",
+        "how_it_works": "Expansion decisions require stable macroeconomic conditions. "
+                        "GDP growth and low unemployment indicate consumer spending capacity in target markets."
+    },
+    "RD_Investment": {
+        "description": "Measures the long-term return on research, development, and innovation spend",
+        "key_drivers": ["Time Horizon", "Operating Margin", "Market Return", "External Risk"],
+        "formula": "ROI = (Future Revenue from Innovation - R&D Cost) / R&D Cost (discounted over time horizon)",
+        "how_it_works": "R&D investments have longer payback periods, so time horizon is critical. "
+                        "The model discounts future returns based on market volatility."
+    },
+    "Hiring": {
+        "description": "Estimates the revenue contribution of expanding headcount",
+        "key_drivers": ["Unemployment Rate", "Baseline Revenue", "Operating Margin", "Campaign Intensity"],
+        "formula": "ROI = (Revenue per Employee x New Hires - Total Compensation Cost) / Total Compensation Cost",
+        "how_it_works": "Hiring ROI depends on labor market conditions. "
+                        "Low unemployment means higher wage costs and competition for talent."
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Industry benchmark data
+# Shown in the "Industry Benchmark Comparison" panel
+# Source: estimates based on public company disclosures, not proprietary data
+# ---------------------------------------------------------------------------
+INDUSTRY_BENCHMARKS = {
+    "Manufacturing": {
+        "Marketing":     {"avg_roi": 0.12, "top_quartile": 0.25, "bottom_quartile": -0.05, "source": "Industry estimates based on public company disclosures"},
+        "Pricing":       {"avg_roi": 0.15, "top_quartile": 0.28, "bottom_quartile":  0.02, "source": "Industry estimates based on public company disclosures"},
+        "Expansion":     {"avg_roi": 0.13, "top_quartile": 0.28, "bottom_quartile": -0.06, "source": "Industry estimates based on public company disclosures"},
+        "RD_Investment": {"avg_roi": 0.18, "top_quartile": 0.35, "bottom_quartile": -0.08, "source": "Industry estimates based on public company disclosures"},
+        "Hiring":        {"avg_roi": 0.09, "top_quartile": 0.20, "bottom_quartile": -0.03, "source": "Industry estimates based on public company disclosures"},
+    },
+    "Retail": {
+        "Marketing":     {"avg_roi": 0.08, "top_quartile": 0.18, "bottom_quartile": -0.10, "source": "Industry estimates based on public company disclosures"},
+        "Pricing":       {"avg_roi": 0.12, "top_quartile": 0.22, "bottom_quartile": -0.04, "source": "Industry estimates based on public company disclosures"},
+        "Expansion":     {"avg_roi": 0.09, "top_quartile": 0.20, "bottom_quartile": -0.12, "source": "Industry estimates based on public company disclosures"},
+        "RD_Investment": {"avg_roi": 0.14, "top_quartile": 0.26, "bottom_quartile": -0.06, "source": "Industry estimates based on public company disclosures"},
+        "Hiring":        {"avg_roi": 0.06, "top_quartile": 0.15, "bottom_quartile": -0.04, "source": "Industry estimates based on public company disclosures"},
+    },
+    "SaaS": {
+        "Marketing":     {"avg_roi": 0.28, "top_quartile": 0.55, "bottom_quartile":  0.06, "source": "Industry estimates based on public company disclosures"},
+        "Pricing":       {"avg_roi": 0.22, "top_quartile": 0.45, "bottom_quartile":  0.04, "source": "Industry estimates based on public company disclosures"},
+        "Expansion":     {"avg_roi": 0.32, "top_quartile": 0.60, "bottom_quartile":  0.08, "source": "Industry estimates based on public company disclosures"},
+        "RD_Investment": {"avg_roi": 0.35, "top_quartile": 0.65, "bottom_quartile":  0.09, "source": "Industry estimates based on public company disclosures"},
+        "Hiring":        {"avg_roi": 0.24, "top_quartile": 0.48, "bottom_quartile":  0.04, "source": "Industry estimates based on public company disclosures"},
+    },
+    "Healthcare": {
+        "Marketing":     {"avg_roi": 0.15, "top_quartile": 0.30, "bottom_quartile": -0.02, "source": "Industry estimates based on public company disclosures"},
+        "Pricing":       {"avg_roi": 0.18, "top_quartile": 0.35, "bottom_quartile":  0.02, "source": "Industry estimates based on public company disclosures"},
+        "Expansion":     {"avg_roi": 0.20, "top_quartile": 0.38, "bottom_quartile": -0.04, "source": "Industry estimates based on public company disclosures"},
+        "RD_Investment": {"avg_roi": 0.28, "top_quartile": 0.52, "bottom_quartile":  0.04, "source": "Industry estimates based on public company disclosures"},
+        "Hiring":        {"avg_roi": 0.13, "top_quartile": 0.25, "bottom_quartile": -0.02, "source": "Industry estimates based on public company disclosures"},
+    },
+    "Finance": {
+        "Marketing":     {"avg_roi": 0.16, "top_quartile": 0.32, "bottom_quartile":  0.02, "source": "Industry estimates based on public company disclosures"},
+        "Pricing":       {"avg_roi": 0.20, "top_quartile": 0.38, "bottom_quartile":  0.04, "source": "Industry estimates based on public company disclosures"},
+        "Expansion":     {"avg_roi": 0.15, "top_quartile": 0.30, "bottom_quartile": -0.04, "source": "Industry estimates based on public company disclosures"},
+        "RD_Investment": {"avg_roi": 0.24, "top_quartile": 0.45, "bottom_quartile":  0.04, "source": "Industry estimates based on public company disclosures"},
+        "Hiring":        {"avg_roi": 0.12, "top_quartile": 0.24, "bottom_quartile": -0.02, "source": "Industry estimates based on public company disclosures"},
+    },
+}
+
+# ---------------------------------------------------------------------------
+# ML model loading
+# ---------------------------------------------------------------------------
+MODEL_ARTIFACTS = None
+
+def load_model():
+    """Load the trained ensemble model from S3 on first call, then cache in memory."""
+    global MODEL_ARTIFACTS
+    if MODEL_ARTIFACTS is None:
+        s3  = boto3.client("s3", region_name="us-east-1")
+        obj = s3.get_object(Bucket="deloitteml", Key="models/roi_model.pkl")
+        MODEL_ARTIFACTS = joblib.load(io.BytesIO(obj["Body"].read()))
+        print("Model loaded from S3")
+    return MODEL_ARTIFACTS
+
+@app.on_event("startup")
+async def startup():
+    """Pre-load the model on server startup to avoid cold-start latency."""
+    load_model()
+
+
+# ---------------------------------------------------------------------------
+# Bedrock helper
+# ---------------------------------------------------------------------------
+def call_bedrock(prompt: str, max_tokens: int = 600) -> str:
+    """Send a prompt to Claude via AWS Bedrock and return plain-text response."""
+    response = bedrock.invoke_model(
+        modelId=MODEL_ID,
+        body=json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+        }),
+        contentType="application/json",
+        accept="application/json",
+    )
+    text = json.loads(response["body"].read())["content"][0]["text"]
+    # Strip markdown symbols so the output renders cleanly in the frontend
+    return text.replace("**", "").replace("##", "").replace("__", "").strip()
+
+
+# ---------------------------------------------------------------------------
+# AI signal extraction
+# ---------------------------------------------------------------------------
+def extract_signals(news_text: str, industry: str, decision_type: str) -> dict:
+    """
+    Use Claude to extract three quantitative signals from free-form market news.
+
+    Returns a dict with:
+        consumer_sentiment   float  -1 to +1  (negative = bearish, positive = bullish)
+        competitive_pressure float   0 to  1  (higher = more competition)
+        external_risk        int     0 or  1  (1 if macro/regulatory risk detected)
+    """
+    # Return neutral defaults when no news is provided
+    if not news_text.strip():
+        return {"consumer_sentiment": 0.0, "competitive_pressure": 0.5, "external_risk": 0}
+
+    try:
+        prompt = (
+            f"Analyze this market information for a {industry} company considering {decision_type}.\n"
+            f"Market info: {news_text}\n"
+            f'Output ONLY this JSON, no other text:\n'
+            f'{{"consumer_sentiment": <-1 to 1>, "competitive_pressure": <0 to 1>, "external_risk": <0 or 1>}}'
+        )
+        raw   = call_bedrock(prompt, max_tokens=200)
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+    except Exception as e:
+        print(f"Signal extraction error: {e}")
+
+    return {"consumer_sentiment": 0.0, "competitive_pressure": 0.5, "external_risk": 0}
+
+
+# ---------------------------------------------------------------------------
+# Executive report generation
+# ---------------------------------------------------------------------------
+def generate_report(input_dict: dict, prediction: dict) -> str:
+    """
+    Use Claude to write an executive intelligence report based on the full decision context.
+    Output has three sections: CORE RISKS, RECOMMENDATIONS, OPTIMAL TIMING.
+    """
+    try:
+        prompt = (
+            "You are a senior business consultant. Write in plain text only, no markdown.\n\n"
+            f"Decision context:\n"
+            f"- Company: {input_dict.get('Industry')} industry, {input_dict.get('Company_Size')} size\n"
+            f"- Decision: {input_dict.get('Decision_Type')} -- "
+            f"${input_dict.get('Investment_Cost', 0):,.0f} over {input_dict.get('Time_Horizon_Months')} months\n"
+            f"- Macro: GDP={input_dict.get('GDP_Growth', 0):.1%}, "
+            f"VIX={input_dict.get('VIX')}, "
+            f"Unemployment={input_dict.get('Unemployment', 0):.1%}\n"
+            f"- AI signals: Sentiment={input_dict.get('consumer_sentiment', 0):.2f}, "
+            f"Competition={input_dict.get('competitive_pressure', 0):.2f}, "
+            f"External Risk={'Yes' if input_dict.get('external_risk') else 'No'}\n"
+            f"- Model output: ROI={prediction['roi']:.1%}, "
+            f"Risk={prediction['risk_level']}, Verdict={prediction['recommendation']}\n\n"
+            "Write exactly 3 sections:\n\n"
+            "CORE RISKS\n2 concise sentences on the top risks specific to this decision.\n\n"
+            "RECOMMENDATIONS\n1. [Specific action]\n2. [Specific action]\n3. [Specific action]\n\n"
+            "OPTIMAL TIMING\n1 sentence on timing based on macro conditions."
+        )
+        return call_bedrock(prompt)
+    except Exception as e:
+        return f"Report generation failed: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Input validation
+# ---------------------------------------------------------------------------
+def validate_inputs(data: dict) -> dict:
+    """Clamp all inputs to realistic ranges to prevent nonsense model outputs."""
+    data["VIX"]               = max(5,     min(80,   data.get("VIX", 20)))
+    data["GDP_Growth"]        = max(-0.15, min(0.15, data.get("GDP_Growth", 0)))
+    data["Unemployment"]      = max(0.01,  min(0.30, data.get("Unemployment", 0.05)))
+    data["Interest_Rate"]     = max(0.0,   min(0.25, data.get("Interest_Rate", 0.05)))
+    data["Operating_Margin"]  = max(-0.50, min(0.60, data.get("Operating_Margin", 0.10)))
+    data["Investment_Cost"]   = max(1000,            data.get("Investment_Cost", 1_000_000))
+    data["Baseline_Revenue"]  = max(1000,            data.get("Baseline_Revenue", 1_000_000))
+    data["Time_Horizon_Months"] = max(1,  min(60,    data.get("Time_Horizon_Months", 12)))
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Confidence score
+# ---------------------------------------------------------------------------
+def calculate_confidence(signals: dict, input_dict: dict, has_news: bool) -> float:
+    """
+    Multi-factor confidence score reflecting how reliable the prediction is.
+
+    Components:
+        - Market stability (VIX weight 35%)   — calm markets increase confidence
+        - Macro direction  (GDP weight 30%)   — clear GDP trend increases confidence
+        - Signal strength  (AI  weight 20%)   — stronger news signals increase confidence
+        - Base weight                   15%
+        - Penalties: external risk -10%, no news input -8%
+    """
+    vix         = input_dict.get("VIX", 20)
+    gdp         = input_dict.get("GDP_Growth", 0)
+    sentiment   = signals.get("consumer_sentiment", 0)
+    ext_risk    = signals.get("external_risk", 0)
+    competition = signals.get("competitive_pressure", 0.5)
+
+    vix_score       = max(0, 1 - (vix - 10) / 70)
+    gdp_score       = 0.5 + min(0.5, max(-0.5, gdp * 5))
+    signal_strength = abs(sentiment) * 0.3 + abs(competition - 0.5) * 2 * 0.2
+    penalty         = ext_risk * 0.10 + (0.08 if not has_news else 0.0)
+
+    score = vix_score * 0.35 + gdp_score * 0.30 + signal_strength * 0.20 + 0.15 - penalty
+    return round(max(0.45, min(0.90, score)), 2)
+
+
+# ---------------------------------------------------------------------------
+# Verdict logic
+# ---------------------------------------------------------------------------
+def get_verdict(roi: float, risk_level: str) -> str:
+    """
+    Determine the investment verdict based on both ROI and risk level.
+    A positive ROI with High risk does NOT automatically mean 'Proceed'.
+    """
+    if roi > 0.25 and risk_level in ["Low", "Medium"]:   return "Proceed"
+    if roi > 0.10 and risk_level == "Low":                return "Proceed"
+    if roi > 0    and risk_level in ["Low", "Medium"]:    return "Proceed with Caution"
+    if roi > 0.15 and risk_level == "Medium-High":        return "Proceed with Caution"
+    if roi > 0    and risk_level == "Medium-High":        return "Proceed with Caution"
+    if roi > 0.20 and risk_level == "High":               return "Proceed with Caution"
+    return "Do Not Proceed"
+
+def get_verdict_tag(verdict: str) -> str:
+    """Short action tag shown below the verdict label in the frontend."""
+    if verdict == "Proceed":              return "FULL INVESTMENT"
+    if verdict == "Proceed with Caution": return "PHASE INVESTMENT"
+    return "HOLD DECISION"
+
+
+# ---------------------------------------------------------------------------
+# ROI breakdown
+# ---------------------------------------------------------------------------
+def calculate_roi_breakdown(input_dict: dict, base_roi: float) -> dict:
+    """
+    Build a transparent breakdown of how the final ROI was calculated.
+    Each AI signal adjustment uses an explicit formula visible to the user.
+
+    Adjustment formulas:
+        sentiment_adj    = sentiment   * 0.18
+        risk_adj         = ext_risk    * -0.12
+        competition_adj  = (competition - 0.5) * -0.06
+    """
+    revenue     = input_dict.get("Baseline_Revenue", 1e8)
+    margin      = input_dict.get("Operating_Margin", 0.10)
+    investment  = input_dict.get("Investment_Cost", 1e6)
+    sentiment   = input_dict.get("consumer_sentiment", 0)
+    ext_risk    = input_dict.get("external_risk", 0)
+    competition = input_dict.get("competitive_pressure", 0.5)
+
+    s_adj = sentiment   *  0.18
+    r_adj = ext_risk    * -0.12
+    c_adj = (competition - 0.5) * -0.06
+
+    adj_roi    = float(np.clip(base_roi + s_adj + r_adj + c_adj, -0.60, 0.80))
+    rev_change = revenue * adj_roi * 0.4
+    cost_change = (abs(rev_change) * (1 - margin) * 0.7 if rev_change > 0
+                   else abs(rev_change) * 0.5)
+    profit = rev_change - cost_change - investment
+
+    return {
+        "ml_base_roi_pct":            round(base_roi * 100, 1),
+        "sentiment_adjustment_pct":   round(s_adj    * 100, 1),
+        "risk_adjustment_pct":        round(r_adj    * 100, 1),
+        "competition_adjustment_pct": round(c_adj    * 100, 1),
+        "final_roi_pct":              round(adj_roi  * 100, 1),
+        "revenue_change":             round(rev_change, 0),
+        "cost_change":                round(cost_change, 0),
+        "profit_change":              round(profit, 0),
+        "investment":                 round(investment, 0),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Key factors
+# ---------------------------------------------------------------------------
+def get_key_factors(input_dict: dict, signals: dict) -> list:
+    """
+    Identify which variables had the most significant impact on the prediction.
+    Returns plain-language explanations shown in the "Key Factors" panel.
+    """
+    factors      = []
+    vix          = input_dict.get("VIX", 20)
+    gdp          = input_dict.get("GDP_Growth", 0)
+    sentiment    = signals.get("consumer_sentiment", 0)
+    ext_risk     = signals.get("external_risk", 0)
+    competition  = signals.get("competitive_pressure", 0.5)
+    unemployment = input_dict.get("Unemployment", 0.05)
+
+    if vix > 30:
+        factors.append({"factor": "Market Volatility (VIX)", "value": f"{vix:.0f}", "impact": "negative",
+            "reason": f"VIX at {vix:.0f} signals elevated uncertainty. Returns compress when VIX exceeds 25."})
+    elif vix < 18:
+        factors.append({"factor": "Market Volatility (VIX)", "value": f"{vix:.0f}", "impact": "positive",
+            "reason": f"VIX at {vix:.0f} reflects calm conditions, supporting confidence in projected returns."})
+
+    if gdp < -0.005:
+        factors.append({"factor": "GDP Growth", "value": f"{gdp:.1%}", "impact": "negative",
+            "reason": "Contracting economy reduces consumer demand and increases downside risk."})
+    elif gdp > 0.02:
+        factors.append({"factor": "GDP Growth", "value": f"{gdp:.1%}", "impact": "positive",
+            "reason": "Positive GDP growth signals expanding demand, supporting revenue projections."})
+
+    if sentiment < -0.3:
+        factors.append({"factor": "Consumer Sentiment (AI)", "value": f"{sentiment:.2f}", "impact": "negative",
+            "reason": "Negative sentiment from news reduces expected demand and conversion rates."})
+    elif sentiment > 0.3:
+        factors.append({"factor": "Consumer Sentiment (AI)", "value": f"{sentiment:.2f}", "impact": "positive",
+            "reason": "Positive sentiment in news flow boosts demand projections."})
+
+    if ext_risk == 1:
+        factors.append({"factor": "External Risk (AI)", "value": "Flagged", "impact": "negative",
+            "reason": "AI identified external risk signals in the news, reducing projected ROI by 12%."})
+
+    if competition > 0.65:
+        factors.append({"factor": "Competitive Pressure (AI)", "value": f"{competition:.2f}", "impact": "negative",
+            "reason": "High competition detected in news. Compresses margin improvement potential."})
+
+    if unemployment > 0.06:
+        factors.append({"factor": "Unemployment Rate", "value": f"{unemployment:.1%}", "impact": "negative",
+            "reason": "High unemployment signals weak consumer spending capacity."})
+
+    return factors
+
+
+# ---------------------------------------------------------------------------
+# ML prediction
+# ---------------------------------------------------------------------------
+def run_prediction(data: dict, artifacts: dict) -> dict:
+    """
+    Run the ensemble ML model and compute the final ROI prediction.
+
+    Steps:
+        1. Label-encode categorical features using encoders saved during training
+        2. Engineer derived features (must match training pipeline)
+        3. Run ensemble model prediction
+        4. Scale raw output to realistic ROI range (raw output inflated by synthetic data)
+        5. Apply AI signal adjustments with explicit formulas
+        6. Compute risk level and investment verdict
+    """
+    model    = artifacts["model"]
+    encoders = artifacts["encoders"]
+    features = artifacts["features"]
+    processed = data.copy()
+
+    # Encode categorical columns
+    for col in ["Industry", "Company_Size", "Decision_Type", "Campaign_Intensity"]:
+        if col in processed and col in encoders:
+            try:
+                processed[col] = encoders[col].transform([str(processed[col])])[0]
+            except Exception:
+                processed[col] = 0  # Default for unseen category
+
+    # Derived features — must match the feature set used during model training
+    processed["investment_ratio"]    = processed.get("Investment_Cost", 0) / (processed.get("Baseline_Revenue", 1) + 1)
+    vix = processed.get("VIX", 20)
+    processed["macro_stress"]        = (vix / 50 * 0.4
+                                        + processed.get("Unemployment", 0.05) * 3 * 0.3
+                                        + max(0, -processed.get("GDP_Growth", 0) * 10) * 0.3)
+    processed["vol_vix"]             = processed.get("Vol_30D", 0.02) * vix
+    processed["margin_x_investment"] = processed.get("Operating_Margin", 0.1) * processed.get("Investment_Cost", 0)
+
+    # Raw model output
+    raw_roi  = float(model.predict(np.array([[processed.get(f, 0) for f in features]]))[0])
+
+    # Compress to realistic range — synthetic training data inflates raw outputs
+    base_roi = float(np.clip(raw_roi * 0.06, -0.50, 0.80))
+
+    # Apply AI signal adjustments
+    sentiment   = data.get("consumer_sentiment", 0)
+    ext_risk    = data.get("external_risk", 0)
+    competition = data.get("competitive_pressure", 0.5)
+
+    final_roi = float(np.clip(
+        base_roi + sentiment * 0.18 - ext_risk * 0.12 - (competition - 0.5) * 0.06,
+        -0.60, 0.80
+    ))
+
+    # Risk level derived from macro stress index and external risk flag
+    risk_score = ext_risk * 0.4 + processed["macro_stress"] * 0.6
+    risk_level = ("Low"         if risk_score < 0.25 else
+                  "Medium"      if risk_score < 0.45 else
+                  "Medium-High" if risk_score < 0.65 else "High")
+
+    verdict = get_verdict(final_roi, risk_level)
+
+    return {
+        "roi":            final_roi,
+        "risk_level":     risk_level,
+        "recommendation": verdict,
+        "verdict_tag":    get_verdict_tag(verdict),
+        "base_roi":       base_roi,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Request / response schemas
+# ---------------------------------------------------------------------------
+class PredictRequest(BaseModel):
+    Industry: str
+    Company_Size: str
+    Operating_Margin: float
+    Baseline_Revenue: float
+    Decision_Type: str
+    Investment_Cost: float
+    Time_Horizon_Months: int
+    Campaign_Intensity: str
+    GDP_Growth: float
+    Inflation_Expect: float
+    Unemployment: float
+    Interest_Rate: float
+    VIX: float
+    Vol_30D: float
+    Mkt_Ret: float
+    External_Risk_Flag: int
+    news_text: str = ""
+    anthropic_api_key: str = ""  # Not used — auth handled by IAM role via Bedrock
+
+class PredictResponse(BaseModel):
+    roi: float
+    confidence: float
+    risk_level: str
+    recommendation: str
+    verdict_tag: str
+    consumer_sentiment: float
+    competitive_pressure: float
+    external_risk: int
+    ai_report: str
+    decision_logic: dict
+    roi_breakdown: dict
+    key_factors: list
+    benchmark: dict
+
+
+# ---------------------------------------------------------------------------
+# API routes
+# ---------------------------------------------------------------------------
+@app.get("/")
+def health():
+    """Health check — confirm the API is running."""
+    return {"status": "ok", "message": "Deloitte ROI Decision System Running"}
+
+
+@app.post("/predict", response_model=PredictResponse)
+def predict(req: PredictRequest):
+    """
+    Main prediction endpoint.
+
+    Flow:
+        1. Validate and clamp all inputs
+        2. Extract AI signals from news text via Claude (Bedrock)
+        3. Run ML ensemble prediction
+        4. Calculate multi-factor confidence score
+        5. Generate executive intelligence report via Claude (Bedrock)
+        6. Build transparency data: ROI breakdown + key factors
+        7. Look up industry benchmark for comparison
+        8. Return full response to the React frontend
+    """
+    artifacts  = load_model()
+    input_dict = validate_inputs(req.dict())
+
+    has_news   = bool(req.news_text.strip())
+    signals    = extract_signals(req.news_text, req.Industry, req.Decision_Type)
+    full_input = {**input_dict, **signals}
+
+    prediction  = run_prediction(full_input, artifacts)
+    confidence  = calculate_confidence(signals, full_input, has_news)
+    report      = generate_report(full_input, {**prediction, "confidence": confidence})
+    breakdown   = calculate_roi_breakdown(full_input, prediction["base_roi"])
+    key_factors = get_key_factors(input_dict, signals)
+
+    decision_logic = DECISION_TYPE_LOGIC.get(req.Decision_Type, DECISION_TYPE_LOGIC["Marketing"])
+    benchmark = INDUSTRY_BENCHMARKS.get(req.Industry, {}).get(
+        req.Decision_Type,
+        {"avg_roi": 0.15, "top_quartile": 0.30, "bottom_quartile": -0.05,
+         "source": "Industry estimates based on public company disclosures"},
+    )
+
+    return PredictResponse(
+        roi=prediction["roi"],
+        confidence=confidence,
+        risk_level=prediction["risk_level"],
+        recommendation=prediction["recommendation"],
+        verdict_tag=prediction["verdict_tag"],
+        consumer_sentiment=signals["consumer_sentiment"],
+        competitive_pressure=signals["competitive_pressure"],
+        external_risk=signals["external_risk"],
+        ai_report=report,
+        decision_logic=decision_logic,
+        roi_breakdown=breakdown,
+        key_factors=key_factors,
+        benchmark=benchmark,
+    )
