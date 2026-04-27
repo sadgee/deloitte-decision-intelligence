@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.env
+venv/
+*.pkl
+
+# Node
+node_modules/
+build/
+
+# AWS / secrets
+.aws/
+*.pem
+*.key
+
+# Large model files (keep on S3)
+*.pickle
+data/
