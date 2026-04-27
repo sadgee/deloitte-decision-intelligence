@@ -516,9 +516,6 @@ This platform was developed as part of an academic capstone engagement between *
 
 <br/>
 
----
-
-## 👥 Team
 
 <div align="center">
 
